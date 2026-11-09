@@ -1,12 +1,14 @@
-name: Build LineForge Android APK
+name: Build and Release LineForge Android APK
 
 on:
   push:
     branches: [main, master]
+    tags: ['v*']
   workflow_dispatch:
 
+# Required for creating tags/releases with the built-in GITHUB_TOKEN.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -21,7 +23,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # v3 requested the removed legacy "tools" package by default.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
@@ -38,9 +39,51 @@ jobs:
       - name: Build installable debug APK
         run: gradle --no-daemon :app:assembleDebug
 
-      - name: Upload APK
+      - name: Upload APK as Actions artifact
         uses: actions/upload-artifact@v4
         with:
           name: LineForge-LFR-Android-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 30
+
+      # On pushes to main/master: create a uniquely tagged preview Release.
+      # On v1.2.3 tags: create a versioned Release.
+      # On reruns: replace the existing APK asset on that same Release.
+      - name: Publish APK to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" == v* ]]; then
+            TAG="$GITHUB_REF_NAME"
+            TITLE="LineForge LFR $TAG"
+            STABLE=true
+          else
+            TAG="build-${GITHUB_RUN_NUMBER}"
+            TITLE="LineForge LFR preview $TAG"
+            STABLE=false
+          fi
+
+          mkdir -p dist
+          APK="dist/LineForge-LFR-${TAG}.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$APK"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release already exists: $TAG. Updating its APK asset."
+            gh release upload "$TAG" "$APK" --clobber
+          elif [[ "$STABLE" == true ]]; then
+            gh release create "$TAG" "$APK" \
+              --verify-tag \
+              --title "$TITLE" \
+              --generate-notes
+          else
+            gh release create "$TAG" "$APK" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes "Automatic test APK from commit $GITHUB_SHA. This is a debug-signed build, not a production-signed release." \
+              --prerelease \
+              --latest=false
+          fi
