@@ -1,77 +1,71 @@
-# LineForge LFR — Android Bluetooth PID controller
+# LineForge LFR v1.1.0 — ESP32-S3 / HC-06 / QTR-8A
 
-A dark, streamlined native Android app for an ESP32-S3 QTR-8A + TB6612FNG line follower using **HC-06 or HC-05 Bluetooth Classic SPP**, 9600 baud.
+Native Android (Java) Bluetooth Classic SPP controller + ESP32-S3 firmware. The application talks to an **HC-06** at **9600 baud**. No BLE or internet connection is required.
 
-## What is included
+## What changed in v1.1.0
 
-- `app/`: complete Android Studio Java source (no third-party UI libraries)
-- `ESP32S3_LFR_BT_NVS_LineForge/ESP32S3_LFR_BT_NVS_LineForge.ino`: your existing NVS firmware extended with PID readback and a heartbeat watchdog
-- `.github/workflows/build-apk.yml`: a GitHub Actions job that builds an installable `app-debug.apk` and uploads it as an artifact
+- **Live animated 8-channel QTR-8A sensor strip**, updated about **8 times per second**, even with motors STOPPED. Bar height follows the calibrated sensor's black-line reflectance; the glowing marker estimates line position. While calibrating, the bars show raw ADC signals.
+- **Reliable, checksum-validated telemetry**. Garbage/boot-log bytes and incomplete packets are discarded, and CRC failures are counted, rather than reporting every byte as an error. The Bluetooth SPP byte stream is **not** assumed to preserve packet boundaries.
+- **START confirmation**. The app now says START SENT until the ESP32 returns an authenticated status packet. Motor heartbeat continues during this pending state; failure to confirm is reported.
+- **READ SAVED QTR CALIBRATION** shows the eight stored white/black ADC reference pairs (saved in ESP32 NVS).
+- **READ FROM ROBOT** retrieves all six PID numerator/divider fields from ESP32 RAM/NVS, along with the true motor and calibration status.
+- Firmware uses **Serial0** (UART0) on native ESP32-S3 **RX GPIO44, TX GPIO43**. Keep **USB CDC On Boot = Enabled** so Serial Monitor stays on USB; all the other original GPIOs remain unchanged.
+- PID changes are saved to NVS when motors are stopped (no flash stalls while driving); calibration is saved after successful recalibration.
+- **GitHub Actions** tests the protocol, builds APK and automatically attaches both the APK and matching firmware to a preview/stable GitHub Release.
 
-**The APK cannot be prebuilt in this environment because Android SDK/build tools are unavailable.** Build it in Android Studio or via the included GitHub workflow. An APK must come from an actual Android toolchain; do not rename this ZIP to `.apk`.
+## Upload and build
 
-## Building the APK (Windows / Android Studio)
+1. Unzip the project. **Copy the contents of `LineForge_LFR` into the ROOT of your GitHub repository**, so that `app/`, `build.gradle`, `settings.gradle`, `.github/workflows/build-apk.yml`, `tests/`, and `ESP32S3_LFR_BT_NVS_LineForge_v2/` are at the top level. Preserve `.github` (hidden on some file managers).
+2. Commit and push to `main`. GitHub Actions → Build and Release LineForge v1.1 APK will build, test and publish a `build-N` preview Release. Or push a tag like `v1.1.0` to publish a versioned Release.
+3. Download the APK under GitHub **Releases** → latest preview (or v1.1.0). The APK is created by GitHub Actions, **not included in this source ZIP**.
+4. Flash `ESP32S3_LFR_BT_NVS_LineForge_v2/ESP32S3_LFR_BT_NVS_LineForge_v2.ino` using Arduino-ESP32 3.x, board **ESP32S3 Dev Module**, **USB CDC On Boot: Enabled**, monitor 115200 USB.
+5. Pair HC-06 via Android Bluetooth settings; open the app, connect and check that both **PID status** and **moving eight sensor bars** appear. Use READ SAVED QTR CALIBRATION to verify saved min/max. Test START with wheels raised.
 
-1. Unzip the project and open the **LineForge_LFR** folder in Android Studio.
-2. Let Android Studio install Android SDK Platform 35 and sync Gradle. Use **JDK 17** (Android Studio's bundled JDK works).
-3. Select **Build > Build App Bundle(s) / APK(s) > Build APK(s)**. Depending on Studio version this may be **Build > Generate App Bundles or APKs > Generate APKs**.
-4. Find the debug APK at `app/build/outputs/apk/debug/app-debug.apk`.
-5. Copy the APK to your phone, allow installation from your file manager, and install. No account or internet is required in the app.
+**Signing note:** the workflow currently builds **debug-signed** APKs. GitHub's ephemeral runners may generate different debug keys. Android may refuse to update an older APK; uninstalling the old app may be necessary. A permanent release signing key is the next step for seamless upgrades. Keep app settings backed up as uninstalling deletes the phone app's local settings; the ESP32 NVS data is unaffected.
 
-### Build an APK on GitHub (no local Android Studio installation)
+## Hardware checklist
 
-1. Create a GitHub repository and upload all the contents of this project, including the hidden `.github` folder.
-2. Select **Actions > Build LineForge Android APK > Run workflow**, or push to the `main` branch.
-3. When the workflow completes, open the workflow run and download the **LineForge-LFR-Android-APK** artifact ZIP.
-4. Extract the ZIP to get `app-debug.apk`, and install it on Android.
+- HC-06 TX → **ESP32-S3 GPIO44 RX**, HC-06 RX ← **GPIO43 TX**, GND common. HC-06 serial configured at 9600 baud (8N1).
+- HC-06 logic supply: regulated 3.3 V after regulator bypass; do not put 5 V onto the bypassed module.
+- TB6612FNG `STBY` HIGH, `VCC` 3.3 V, `VM` motor supply, common GND. GPIOs motor A: AIN1 42, AIN2 41, PWMA 21; motor B: BIN1 40, BIN2 39, PWMB 47.
+- QTR-8A ADC outputs must remain within the ESP32-S3's safe input voltage. Supply QTR at 3.3 V or adapt its outputs safely.
+- If strange bytes persist, check UART baud, module power, common ground, wiring, and **whether the ESP32 resets when motors engage**. Framing can detect/recover from corruption; it cannot correct an unstable electrical supply.
 
-The debug APK is development-signed by Android tooling. For personal use it is installable; for publication you need a release keystore and a signed release build.
+## Bluetooth protocol
 
-## Install and connect
+Inbound, existing two-byte binary commands remain compatible:
 
-1. Power your ESP32-S3 and HC-06. Confirm the module has 3.3 V power, 3.3 V UART logic and shared GND.
-2. Open phone **Bluetooth settings** and pair with `HC-06` / `HC-05`. Typical module PINs are `1234` or `0000` (your module may differ).
-3. Open LineForge, allow **Nearby devices**, select your paired module, and connect.
-4. The app requests the actual Kp/Ki/Kd settings saved in ESP32 NVS. If no readback appears, flash the updated `.ino`.
-5. Adjust Kp / Ki / Kd; each uses numerator `0..255` and a divider `10^0 .. 10^4`.
-6. Press **APPLY ALL** to send all six settings (12 bytes); firmware saves them to NVS after 2 seconds of inactivity.
-7. Place the robot on the track and press **START RUN**. STOP sends an immediate two-byte stop command.
-8. **RECALIBRATE SENSORS** prompts you to place the array on white, followed by sweeping it over black; the calibration is stored on the ESP32.
+| Command | Value | Meaning |
+|---|---|---|
+| 1 / 2 | 0–255 / 0–4 | Kp numerator / divider |
+| 3 / 4 | 0–255 / 0–4 | Ki numerator / divider |
+| 5 / 6 | 0–255 / 0–4 | Kd numerator / divider |
+| 7 | 0 or 1 | STOP / START |
+| 8 | 1 | QTR recalibration (2s white then 5s sweep) |
+| 9 | 0 | PID and motor status request |
+| 10 | 1 | Heartbeat every 600 ms while running |
+| 11 | 0 or 1 | Disable / enable 8Hz telemetry; enabling refreshes a four-second lease |
+| 12 | 0 | Read NVS white/black calibration arrays |
 
-For live slider adjustments, enable **Live tuning**. The app sends the two associated commands when you release a slider, not on every movement.
+The phone sends `[11,1]` about every 1.8 seconds to keep telemetry enabled. The previous commands 1–10 still work if your original app is used without enabling telemetry. START is refused by firmware if calibration is invalid or in progress.
 
-## Binary protocol
+**Framed ESP32 → phone replies** (used after `[11,1]`):
 
-| Direction | Message | Bytes |
-|---|---|---:|
-| App -> ESP32 | `[1,kpVal]` / `[2,kpDiv]` | 2 each |
-| App -> ESP32 | `[3,kiVal]` / `[4,kiDiv]` | 2 each |
-| App -> ESP32 | `[5,kdVal]` / `[6,kdDiv]` | 2 each |
-| App -> ESP32 | `[7,0]` stop; `[7,1]` start | 2 |
-| App -> ESP32 | `[8,1]` recalibrate | 2 |
-| App -> ESP32 | `[9,0]` read PID and status (new) | 2 |
-| App -> ESP32 | `[10,1]` heartbeat (new) | 2 |
-| ESP32 -> App | `0x06` ACK; `0x15` NAK | 1 |
-| ESP32 -> App | `0xC0` calibration fail / `0xC1` success / `0xC2` NVS loaded | 1 |
-| ESP32 -> App | `0xD1` safety timeout | 1 |
-| ESP32 -> App | `0xD0 + six PID bytes + flags + XOR` | **9** |
+`A5 5A TYPE LEN SEQ PAYLOAD CRC8`
 
-Status flags: bit 0 calibration valid, bit 1 robot running, bit 2 calibrating. Checksum XORs all six PID data bytes and flags (seven bytes after the `0xD0` marker).
+CRC8 polynomial `0x07`, initial `0x00`, no reflection or final XOR, calculated over TYPE, LEN, SEQ and PAYLOAD. A frame is at most **54 bytes** including headers/CRC; status frame 14 bytes; telemetry frame **19 bytes**, sent at 8Hz (~152 bytes/sec UART payload). This is comfortably below ~960 bytes/sec available with UART 9600, 8N1, subject to radio and scheduling overhead. No individual message exceeds 256 bytes.
 
-The full upload is **12 UART bytes**, each acknowledgement is one byte. Heartbeat traffic is **two bytes per 600 ms** plus one-byte ACK. All individual messages are below 256 bytes. The current ESP32 serial implementation has no framing for the incoming two-byte messages; corrupted/lost bytes can cause parser misalignment. For robust competition telemetry, a framed protocol would be a future improvement.
+| Packet type | Data |
+|---|---|
+| `0x51` | 8 bytes: Kp num, Kp div, Ki num, Ki div, Kd num, Kd div, flags, reserved. Flags bit 0 calibration ready, bit 1 motors running, bit 2 calibrating. |
+| `0x52` | 13 bytes: sensor levels S1–S8 (8× uint8, 0 white/255 black); line position uint16 little-endian (0–7000; 0xFFFF=line lost); flags; signed left/right PWM percentage int8. |
+| `0x53` | 32 bytes: for each of eight sensors, `uint16 LE white`, `uint16 LE black`. |
 
-## Safety and limitations
+Legacy replies accepted: `0x06` ACK, `0x15` NAK, `0xC0` calibration failure, `0xC1` calibration success, `0xC2` NVS calibration loaded, `0xD1` heartbeat timeout; legacy 9-byte `0xD0` status frame accepted too.
 
-- Test with wheels lifted before placing the robot on a track.
-- **STOP is a software command** and requires a working Bluetooth link; provide a physical power switch / kill switch.
-- With `WAIT_FOR_APP = true` (as shipped), if the phone stops sending `[10,1]`, updated ESP32 firmware stops the motors after **2.5 seconds**. If you flash an older sketch, this timeout does **not** exist.
-- The app also sends STOP when it leaves the foreground. Keeping the screen awake while running helps avoid involuntary disconnects.
-- The existing ESP32 sketch runs a blocking calibration for 7 s and prevents motor movement until success. Avoid triggering calibration while the robot is in motion.
-- There is no continuous sensor/error telemetry because the current ESP32 firmware only logs that information over USB. Connection status is based on the Bluetooth socket, not proof of motor motion or perfect delivery.
-- HC-06 uses Bluetooth **Classic SPP** and does not work with Web Bluetooth / BLE-only controllers. iOS does not provide general HC-06 SPP access; this project is for Android.
-- On some ESP32-S3 DevKit variants the onboard RGB LED is GPIO38 instead of GPIO48; adjust the firmware to match your board.
-- QTR-8A analog outputs must not exceed the ESP32-S3 ADC input range. Use a 3.3 V sensor supply or proper scaling, and ensure TB6612FNG STBY is high.
+## Limitations
 
-## Version and build validation
-
-Source was prepared against Android API 35 and Arduino-ESP32 3.x. The app is untested on a physical Android phone and the code has not been compiled with an actual Android SDK in this environment. Treat this as a build-ready project, not a verified prebuilt APK.
+- **No real hardware or full Android SDK build was available here.** The ESP32 sketch was syntax-checked using interface stubs, and the Android source was Java-compiled using API interface stubs. Actual Arduino IDE compilation and GitHub Actions `:app:assembleDebug` are still required. Protocol parser tests passed.
+- A Bluetooth connection to HC-06 alone does **not** mean ESP32 UART responses are valid. If sensor/status frames never arrive, check the electrical UART path and 9600 baud; do not trust the START button as proof of motor activation.
+- The command side retains the original 2-byte format for backward compatibility; it has no checksum. Only the **new outgoing telemetry/status frames** have CRC8 error detection. For more fault-tolerant competition use, a later protocol version should frame and acknowledge commands too.
+- Robot control is safety-oriented: STOP when app leaves foreground; firmware also has 2.5s heartbeat timeout. These protections do not replace a physical motor power cutoff.

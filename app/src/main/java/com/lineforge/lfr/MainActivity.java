@@ -21,6 +21,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
@@ -45,6 +46,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
@@ -84,6 +86,14 @@ public final class MainActivity extends Activity {
     private volatile OutputStream socketOut;
     private volatile boolean connected = false;
     private boolean running = false;
+    private boolean startPending = false;
+    private int keepAliveTicks = 0;
+    private int droppedBytes = 0, crcErrors = 0;
+    private long lastLinkWarning = 0;
+    private boolean calibrationDialogPending = false;
+    private final ArrayDeque<String> recentEvents = new ArrayDeque<>();
+    private QtrSensorView sensorView;
+    private TextView sensorInfo, calibrationInfo, linkInfo;
     private boolean liveTune = false;
     private boolean calibrationValid = false;
     private boolean queryReceived = false;
@@ -97,7 +107,12 @@ public final class MainActivity extends Activity {
     private String lastEvent = "Ready to pair";
     private final Runnable heartbeatTask = new Runnable() {
         @Override public void run() {
-            if (connected && running) sendBytes(new byte[]{10, 1}, false);
+            if (connected && (running || startPending)) sendBytes(new byte[]{10, 1}, false);
+            // The firmware stops telemetry after 4s without a lease refresh.
+            if (connected && (++keepAliveTicks % 3) == 0) {
+                sendBytes(new byte[]{11, 1}, false);
+                if (!queryReceived) sendBytes(new byte[]{9, 0}, false);
+            }
             ui.postDelayed(this, 600);
         }
     };
@@ -114,8 +129,9 @@ public final class MainActivity extends Activity {
 
     @Override protected void onStop() {
         // Treat the app leaving the foreground as an intentional STOP.
-        if (running && connected) {
+        if ((running || startPending) && connected) {
             running = false;
+            startPending = false;
             sendBytes(new byte[]{7, 0}, true);
             updateRunUI();
         }
@@ -252,6 +268,27 @@ public final class MainActivity extends Activity {
         });
         deviceCard.addView(connectButton, full());
         content.addView(deviceCard, full());
+        content.addView(gap(14));
+
+        // Always-visible animated eight-channel QTR sensor monitor.
+        LinearLayout sensorCard = card();
+        LinearLayout sensorHeading = row();
+        sensorHeading.addView(txt("LIVE LINE ARRAY", 13, TEXT, true), weighted());
+        sensorHeading.addView(txt("QTR-8A  •  S1–S8", 11, MUTED, false));
+        sensorCard.addView(sensorHeading);
+        sensorCard.addView(gap(8));
+        sensorView = new QtrSensorView(this);
+        sensorCard.addView(sensorView, full());
+        sensorInfo = txt("Waiting for verified sensor packets…", 11, MUTED, false);
+        sensorCard.addView(sensorInfo);
+        sensorCard.addView(gap(10));
+        calibrationInfo = txt("Saved white/black ranges: awaiting ESP32", 11, MUTED, false);
+        sensorCard.addView(calibrationInfo);
+        sensorCard.addView(gap(10));
+        Button readQtr = button("READ SAVED QTR CALIBRATION", PANEL_ALT, TEXT);
+        readQtr.setOnClickListener(v -> requestCalibrationData(true));
+        sensorCard.addView(readQtr, full());
+        content.addView(sensorCard, full());
         content.addView(gap(18));
 
         LinearLayout titleRow = row();
@@ -319,9 +356,12 @@ public final class MainActivity extends Activity {
         eventLog = txt("Waiting for HC-06…", 12, MUTED, false);
         eventLog.setLineSpacing(dp(5), 1.0f);
         console.addView(eventLog);
+        console.addView(gap(8));
+        linkInfo = txt("Verified frames: 0  •  CRC errors: 0  •  ignored: 0", 10, MUTED, false);
+        console.addView(linkInfo);
         content.addView(console, full());
         content.addView(gap(14));
-        TextView foot = txt("Protocol v2  •  9600 baud  •  Binary two-byte commands", 11, MUTED, false);
+        TextView foot = txt("Protocol v3  •  CRC8 telemetry  •  9600 baud", 11, MUTED, false);
         foot.setGravity(Gravity.CENTER);
         content.addView(foot);
 
@@ -518,32 +558,44 @@ public final class MainActivity extends Activity {
     }
 
     private void startRobot() {
-        if (!connected) { showToast("Connect the HC-06 first"); return; }
-        // The ESP32 only accepts START when calibration is valid.
+        if (!connected) { showToast("Connect HC-06 first"); return; }
         if (queryReceived && !calibrationValid) {
-            showToast("Calibrate the QTR-8A before starting");
-            return;
+            showToast("Calibrate QTR-8A before starting"); return;
         }
+        startPending = true;
+        running = false;
         sendBytes(new byte[]{7, 1}, true);
-        running = true;
         updateRunUI();
-        addEvent("START requested; watchdog heartbeat active.");
+        addEvent("START sent; waiting for verified ESP32 motor status…");
+        ui.postDelayed(() -> {
+            if (connected && startPending) {
+                startPending = false;
+                running = false;
+                updateRunUI();
+                // Do not assume the robot stopped just because its reply was lost.
+                // Explicit STOP as well as the firmware heartbeat timeout.
+                sendBytes(new byte[]{7, 0}, false);
+                addEvent("NO START CONFIRMATION: STOP sent. Check UART, power and firmware.");
+            }
+        }, 2500);
     }
 
     private void stopRobot() {
+        startPending = false;
         running = false;
         updateRunUI();
         if (connected) sendBytes(new byte[]{7, 0}, true);
-        addEvent("STOP requested.");
+        addEvent("STOP requested; waiting for ESP32 status.");
     }
 
     private void updateRunUI() {
         if (heroStatus == null) return;
-        heroStatus.setText(running ? "RUNNING  •  HEARTBEAT ACTIVE" : "MOTORS DISARMED");
-        heroStatus.setTextColor(running ? MINT : MUTED);
-        if (startButton != null) startButton.setAlpha(connected && !running ? 1f : 0.55f);
+        heroStatus.setText(startPending ? "START SENT  •  AWAITING ESP32" :
+                running ? "RUNNING  •  CONFIRMED BY ESP32" : "MOTORS DISARMED");
+        heroStatus.setTextColor(startPending ? ORANGE : running ? MINT : MUTED);
+        if (startButton != null) startButton.setAlpha(connected && !running && !startPending ? 1f : 0.55f);
         if (stopButton != null) stopButton.setAlpha(connected ? 1f : 0.7f);
-        if (running) getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if (running || startPending) getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
 
@@ -555,6 +607,7 @@ public final class MainActivity extends Activity {
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Start calibration", (dialog, which) -> {
                     running = false;
+                    startPending = false;
                     updateRunUI();
                     sendBytes(new byte[]{8, 1}, true);
                     addEvent("Calibrating: 2 s white + 5 s sweep. Awaiting result…");
@@ -568,8 +621,15 @@ public final class MainActivity extends Activity {
         addEvent("Requesting actual PID values from the ESP32…");
         ui.postDelayed(() -> {
             if (connected && !queryReceived)
-                addEvent("No status reply. Flash the included firmware update to enable readback.");
+                addEvent("No verified ESP32 status: check HC-06 UART at 9600, power/GND, RX/TX and possible motor-triggered resets.");
         }, 2300);
+    }
+
+    private void requestCalibrationData(boolean showDialog) {
+        if (!connected) { showToast("Connect HC-06 first"); return; }
+        calibrationDialogPending = showDialog;
+        sendBytes(new byte[]{12, 0}, true);
+        if (showDialog) addEvent("Requesting eight saved white/black calibration pairs…");
     }
 
     private boolean hasConnectPermission() {
@@ -693,7 +753,9 @@ public final class MainActivity extends Activity {
                     if (session.get() != epoch) return;
                     updateConnectionUI(true, name);
                     addEvent("Connected to " + name + " using serial port profile.");
+                    sendBytes(new byte[]{11, 1}, true);
                     requestRobotState();
+                    requestCalibrationData(false);
                 });
                 readSocket(input, epoch);
                 closeQuietly(finalSocket);
@@ -714,67 +776,143 @@ public final class MainActivity extends Activity {
         }, "HC06-Connection").start();
     }
 
+    // Stream parser: ignores boot/noise bytes, verifies CRC8 and recovers from
+    // lost bytes without permanently desynchronizing Bluetooth replies.
     private void readSocket(InputStream input, int epoch) throws IOException {
-        int remaining = 0;
-        byte[] frameBody = new byte[8];
-        int at = 0;
-        while (session.get() == epoch) {
-            int b = input.read();
-            if (b < 0) break;
-            int nextTotal = ++receivedBytes;
-            ui.post(() -> {
-                if (session.get() == epoch) sendCountLabel.setText("TX " + sentBytes + " B  /  RX " + nextTotal + " B");
-            });
-            if (remaining > 0) {
-                frameBody[at++] = (byte)b;
-                remaining--;
-                if (remaining == 0) {
-                    byte[] copy = frameBody.clone();
-                    ui.post(() -> {
-                        if (session.get() == epoch) receiveStateFrame(copy);
-                    });
-                    at = 0;
-                }
-                continue;
+        Protocol.Parser parser = new Protocol.Parser(new Protocol.Listener() {
+            @Override public void onPacket(int type, byte[] payload) {
+                ui.post(() -> {
+                    if (session.get() == epoch) receivePacket(type, payload);
+                });
             }
-            if (b == 0xD0) { remaining = 8; at = 0; continue; }
-            final int reply = b;
+            @Override public void onLegacyStatus(byte[] data) {
+                ui.post(() -> {
+                    if (session.get() == epoch) receiveStateFrame(data, false);
+                });
+            }
+            @Override public void onReply(int code) {
+                ui.post(() -> {
+                    if (session.get() == epoch) handleReply(code);
+                });
+            }
+            @Override public void onDiscarded(int count, boolean checksumError) {
+                if (checksumError) crcErrors++;
+                else droppedBytes += count;
+                long now = SystemClock.uptimeMillis();
+                if (now - lastLinkWarning > 1800) {
+                    lastLinkWarning = now;
+                    final int c = crcErrors, d = droppedBytes;
+                    ui.post(() -> {
+                        if (session.get() != epoch) return;
+                        linkInfo.setText("CRC errors: " + c + "  •  ignored bytes: " + d);
+                        if (!queryReceived && c + d > 4)
+                            addEvent("Unverified UART bytes: check 9600 baud, TX/RX and supply noise.");
+                    });
+                }
+            }
+        });
+        byte[] buffer = new byte[128];
+        while (session.get() == epoch) {
+            int n = input.read(buffer);
+            if (n < 0) break;
+            receivedBytes += n;
+            final int total = receivedBytes;
             ui.post(() -> {
-                if (session.get() == epoch) handleReply(reply);
+                if (session.get() == epoch)
+                    sendCountLabel.setText("TX " + sentBytes + " B  /  RX " + total + " B");
             });
+            parser.feed(buffer, n);
         }
     }
 
     private void handleReply(int b) {
-        if (b == 0x06) return;  // ACK - intentionally don't fill the console
+        if (b == 0x06) return;
         if (b == 0x15) {
-            if (running && !calibrationValid) { running = false; updateRunUI(); }
-            addEvent("ESP32 rejected a command (NAK).");
+            addEvent("ESP32 rejected a command. Check calibration and firmware protocol.");
+            if (startPending) {
+                startPending = false;
+                running = false;
+                updateRunUI();
+            }
             return;
         }
-        if (b == 0xC1) { calibrationValid = true; addEvent("Calibration successful; values saved to NVS."); return; }
-        if (b == 0xC0) { calibrationValid = false; running = false; updateRunUI(); addEvent("Calibration failed. Motors are disabled."); return; }
-        if (b == 0xC2) { calibrationValid = true; addEvent("Saved sensor calibration loaded from NVS."); return; }
-        if (b == 0xD1) { running = false; updateRunUI(); addEvent("ESP32 motor safety timeout: heartbeat lost."); return; }
-        addEvent(String.format(Locale.US, "Unknown reply byte 0x%02X", b));
+        if (b == 0xC1) {
+            calibrationValid = true;
+            addEvent("QTR calibration successful. Saved to NVS.");
+            ui.postDelayed(() -> { requestRobotState(); requestCalibrationData(false); }, 350);
+            return;
+        }
+        if (b == 0xC0) {
+            calibrationValid = false; running = false; startPending = false;
+            updateRunUI(); addEvent("Calibration failed. Motors disabled."); return;
+        }
+        if (b == 0xC2) { calibrationValid = true; addEvent("Saved QTR calibration loaded."); return; }
+        if (b == 0xD1) {
+            running = false; startPending = false; updateRunUI();
+            addEvent("Safety stop: no valid heartbeat at ESP32."); return;
+        }
     }
 
-    private void receiveStateFrame(byte[] data) {
-        int checksum = 0;
-        for (int i = 0; i < 7; ++i) checksum ^= (data[i] & 0xff);
-        if (checksum != (data[7] & 0xff)) { addEvent("Status frame checksum error."); return; }
-        int kpd = data[1] & 0xff, kid = data[3] & 0xff, kdd = data[5] & 0xff;
-        if (kpd > 4 || kid > 4 || kdd > 4) { addEvent("Invalid PID data in status frame."); return; }
-        kp.setData(data[0] & 0xff, kpd);
-        ki.setData(data[2] & 0xff, kid);
-        kd.setData(data[4] & 0xff, kdd);
+    private void receivePacket(int type, byte[] payload) {
+        if (type == Protocol.STATUS && payload.length == 8) {
+            receiveStateFrame(payload, true);
+        } else if (type == Protocol.SENSORS && payload.length == 13) {
+            int[] samples = new int[8];
+            for (int i=0;i<8;i++) samples[i] = payload[i] & 255;
+            int pos = (payload[8] & 255) | ((payload[9] & 255) << 8);
+            int flags = payload[10] & 255;
+            boolean seen = (flags & 1) != 0;
+            boolean cal = (flags & 8) != 0;
+            sensorView.update(samples, pos, seen, cal);
+            int l = (int)payload[11], r = (int)payload[12];
+            sensorInfo.setText(cal ? "Calibration running • raw reflectance levels" :
+                    seen ? String.format(Locale.US, "Line position %.2f / 7   •   Left %+d%%   Right %+d%%",
+                            pos / 1000.0, l, r) :
+                            "LINE LOST  •  Motors L " + l + "%  R " + r + "%");
+        } else if (type == Protocol.CALIBRATION && payload.length == 32) {
+            StringBuilder b = new StringBuilder();
+            int minRange = Integer.MAX_VALUE;
+            for (int i=0;i<8;i++) {
+                int w=(payload[4*i] & 255) | ((payload[4*i+1] & 255)<<8);
+                int black=(payload[4*i+2] & 255) | ((payload[4*i+3] & 255)<<8);
+                int span=black-w;
+                minRange=Math.min(minRange,span);
+                b.append(String.format(Locale.US, "S%d   white %4d   black %4d   span %4d\n",i+1,w,black,span));
+            }
+            calibrationInfo.setText("NVS calibration received • minimum range " + minRange + " ADC counts");
+            if (calibrationDialogPending) {
+                calibrationDialogPending = false;
+                new AlertDialog.Builder(this).setTitle("QTR-8A saved calibration")
+                        .setMessage(b.toString()).setPositiveButton("Done",null).show();
+            }
+        }
+    }
+
+    private void receiveStateFrame(byte[] data, boolean framed) {
+        if (data.length != 8) return;
+        if (!framed) {
+            int checksum = 0;
+            for (int i = 0; i < 7; ++i) checksum ^= (data[i] & 255);
+            if (checksum != (data[7] & 255)) { addEvent("Status checksum error."); return; }
+        }
+        int kpd=data[1] & 255, kid=data[3] & 255, kdd=data[5] & 255;
+        if (kpd>4 || kid>4 || kdd>4) { addEvent("Invalid PID values in status."); return; }
+        int flags = data[6] & 255;
+        if ((flags & ~7) != 0) return;
+        kp.setData(data[0] & 255,kpd);
+        ki.setData(data[2] & 255,kid);
+        kd.setData(data[4] & 255,kdd);
         kp.saveLocal(); ki.saveLocal(); kd.saveLocal();
-        int flags = data[6] & 0xff;
-        calibrationValid = (flags & 1) != 0;
-        running = (flags & 2) != 0;
+        calibrationValid=(flags & 1)!=0;
+        boolean wasPending=startPending;
+        running=(flags & 2)!=0;
+        startPending=false;
         updateRunUI();
-        queryReceived = true;
-        addEvent("PID synchronized from ESP32 NVS/RAM. Calibration: " + (calibrationValid ? "READY" : "NOT READY"));
+        queryReceived=true;
+        if (wasPending || !running)
+            addEvent("Verified ESP32 status: " + (running ? "MOTORS RUNNING" : "STOPPED") +
+                    ", calibration " + (calibrationValid ? "READY" : "MISSING") +
+                    ", PID synchronized.");
     }
 
     private void sendBytes(byte[] payload, boolean reportErrors) {
@@ -815,7 +953,10 @@ public final class MainActivity extends Activity {
     private void disconnectSocket() {
         session.incrementAndGet();
         running = false;
+        startPending = false;
+        queryReceived = false;
         connected = false;
+        if (sensorView != null) sensorView.setConnected(false);
         socketOut = null;
         BluetoothSocket old = socket;
         socket = null;
@@ -830,7 +971,16 @@ public final class MainActivity extends Activity {
 
     private void addEvent(String s) {
         lastEvent = s;
-        if (eventLog != null) eventLog.setText(s);
+        recentEvents.addFirst(s);
+        while (recentEvents.size() > 5) recentEvents.removeLast();
+        if (eventLog != null) {
+            StringBuilder b = new StringBuilder();
+            for (String e : recentEvents) {
+                if (b.length() > 0) b.append("\n\n");
+                b.append("• ").append(e);
+            }
+            eventLog.setText(b.toString());
+        }
     }
 
     private void showToast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }

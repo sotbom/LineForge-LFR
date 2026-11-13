@@ -10,17 +10,26 @@
   - Press BOOT (GPIO0) to stop immediately; hold for 2 s AFTER boot,
     or send [8, 1], to recalibrate. Put the array on WHITE first.
   - Recalibration stops the motors and requires a fresh START command.
+  - START/STOP emit checksummed status replies so the
+    unchanged phone app shows the actual ESP32 run state, not just a request.
+  - START includes an adjustable 180 ms motor breakaway pulse. Test wheels up.
   - UART at 9600 baud: incoming commands are ALWAYS 2 binary bytes.
       [1,value] Kp numerator    [2,value] Kp decimal divider (0..4)
       [3,value] Ki numerator    [4,value] Ki decimal divider (0..4)
       [5,value] Kd numerator    [6,value] Kd decimal divider (0..4)
       [7,0] STOP               [7,1] START
-      [8,1] Recalibrate (app update needed; BOOT button is alternative)
+      [8,1] Recalibrate (BOOT button is alternative)
     [9,0] Read back PID and status: reply = 9 bytes:
       [0xD0, kpVal, kpDiv, kiVal, kiDiv, kdVal, kdDiv, flags, checksum]
       flags bit 0=calibration OK, bit 1=running, bit 2=calibrating
       checksum = XOR of 7 bytes after 0xD0 (values + flags).
     [10,1] Heartbeat while running, every 600 ms; timeout 2500 ms.
+    [11,1] Enable framed telemetry for 4 s (refresh periodically)
+    [11,0] Disable telemetry; [12,0] Read white/black calibration arrays.
+    Frame: A5 5A type length seq payload CRC8(poly=07 over type..payload).
+    Type 51: status (8 payload bytes: six PID fields, flags, reserved).
+    Type 52: eight QTR intensities + position (u16) + flags + signed PWM L/R.
+    Type 53: stored white and black ADC raw readings (32 bytes).
     Replies: 0x06 ACK, 0x15 NAK, 0xC1 calibration success,
              0xC0 calibration failed, 0xC2 stored calibration loaded,
              0xD1 motor safety timeout.
@@ -43,11 +52,17 @@
 // ---------------- User options ----------------
 const bool WAIT_FOR_APP = true;
 const int RGB_LED_PIN = 48;              // use 38 for official DevKitC-1 v1.1
-const int BASE_SPEED = 25;              // percent
-const int MAX_SPEED  = 30;              // percent
+// 25/30% was often too weak to overcome motor static friction.
+// Start with the wheels raised, then tune these for your motors and track.
+const int BASE_SPEED = 45;              // percent of full PWM in PID mode
+const int MAX_SPEED  = 65;              // maximum magnitude of either motor
+const int START_PULSE_SPEED = 60;       // short straight startup pulse, percent
+const uint32_t START_PULSE_MS = 180;    // disable by setting to 0
 const uint32_t PID_SAVE_DELAY_MS = 2000;
 const uint32_t CONTROL_PERIOD_US = 5000;
 const uint32_t BOOT_HOLD_MS = 2000;
+const uint32_t TELEMETRY_PERIOD_MS = 125; // 8Hz, 19-byte packet, ~152B/s
+const uint32_t TELEMETRY_LEASE_MS = 4000; // off after app stops refreshing
 // When WAIT_FOR_APP=false, the robot may run without a phone.
 // Otherwise a lost Bluetooth connection stops motors within 2.5 s.
 const bool REQUIRE_APP_HEARTBEAT = WAIT_FOR_APP;
@@ -64,7 +79,11 @@ const int USER_BOOT_GPIO  = 0;                // hold after startup to recalibra
 
 const int BASE_PWM = BASE_SPEED * 255 / 100;
 const int MAX_PWM = MAX_SPEED * 255 / 100;
-HardwareSerial &BT = Serial1;
+const int START_PULSE_PWM = START_PULSE_SPEED * 255 / 100;
+// The HC-06 is wired to GPIO43/44, which are native UART0 pins.
+// USB CDC On Boot must be ENABLED, so Serial stays on the USB port.
+// Using Serial0 avoids remapping UART1 onto UART0's default pins.
+HardwareSerial &BT = Serial0;
 Preferences prefs;
 bool prefsReady = false;
 
@@ -75,6 +94,9 @@ const uint8_t CAL_SUCCESS = 0xC1;
 const uint8_t CAL_FAILURE = 0xC0;
 const uint8_t CAL_LOADED = 0xC2;
 const uint8_t STATUS_REPLY = 0xD0;
+const uint8_t PKT_STATUS = 0x51;
+const uint8_t PKT_SENSOR = 0x52;
+const uint8_t PKT_CAL = 0x53;
 const uint8_t HEARTBEAT_TIMEOUT_REPLY = 0xD1;
 
 // ---------------- Working state ----------------
@@ -89,6 +111,8 @@ bool calibrating = false;
 bool calibrationPending = false;
 bool robotOn = false;
 bool pidLast = false;
+bool startPulseActive = false;
+uint32_t startPulseAtMs = 0;
 bool pidDirty = false;
 float lastError = 0.0f;
 float lastSeenSide = 1.0f;
@@ -97,6 +121,11 @@ uint32_t lastUs = 0;
 uint32_t lastPIDChangeMs = 0;
 uint32_t lastSaveAttemptMs = 0;
 uint32_t lastHeartbeatMs = 0;
+bool telemetryEnabled = false;
+uint32_t lastTelemetryLeaseMs = 0;
+uint32_t lastTelemetryMs = 0;
+uint8_t frameSequence = 0;
+int lastMotorLeft = 0, lastMotorRight = 0;
 
 // ---------------- NVS blob definitions ----------------
 const uint32_t CAL_MAGIC = 0x4C465243;  // 'LFRC'
@@ -245,17 +274,90 @@ void driveMotor(int in1, int in2, int pwmPin, int speed) {
 }
 
 void setMotors(int left, int right) {
+  lastMotorLeft = left; lastMotorRight = right;
   driveMotor(AIN1, AIN2, PWMA, left);
   driveMotor(BIN1, BIN2, PWMB, right);
 }
 
 void stopRobot() {
+  startPulseActive = false;
   robotOn = false;
   pidLast = false;
   iTerm = 0.0f;
   setMotors(0, 0);
 }
 
+// CRC8 (poly x^8 + x^2 + x + 1), initial value 0, no final XOR.
+uint8_t crc8Update(uint8_t crc, uint8_t b) {
+  crc ^= b;
+  for (uint8_t n = 0; n < 8; n++)
+    crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+  return crc;
+}
+
+void sendFramed(uint8_t type, const uint8_t *payload, uint8_t len) {
+  if (len > 48) return;
+  uint8_t frame[54];
+  frame[0] = 0xA5; frame[1] = 0x5A;
+  frame[2] = type; frame[3] = len; frame[4] = frameSequence++;
+  uint8_t crc = 0;
+  for (int i = 2; i < 5; i++) crc = crc8Update(crc, frame[i]);
+  for (int i = 0; i < len; i++) {
+    frame[5 + i] = payload[i];
+    crc = crc8Update(crc, payload[i]);
+  }
+  frame[5 + len] = crc;
+  BT.write(frame, 6 + len);
+}
+
+void sendCalibrationFrame() {
+  uint8_t p[32];
+  for (int i = 0; i < 8; i++) {
+    p[4*i+0] = (uint8_t)(white[i] & 0xff);
+    p[4*i+1] = (uint8_t)(white[i] >> 8);
+    p[4*i+2] = (uint8_t)(black[i] & 0xff);
+    p[4*i+3] = (uint8_t)(black[i] >> 8);
+  }
+  sendFramed(PKT_CAL, p, sizeof(p));
+}
+
+// Eight calibrated intensities (0 white to 255 black) plus line position.
+// During calibration send raw 12-bit ADC scaled down to 8 bits instead.
+void sendSensorFrameIfDue() {
+  if (!telemetryEnabled) return;
+  const uint32_t now = millis();
+  if ((uint32_t)(now - lastTelemetryLeaseMs) > TELEMETRY_LEASE_MS) {
+    telemetryEnabled = false;
+    return;
+  }
+  if ((uint32_t)(now - lastTelemetryMs) < TELEMETRY_PERIOD_MS) return;
+  lastTelemetryMs = now;
+  uint8_t p[13] = {};
+  long weighted = 0, total = 0;
+  for (int s = 0; s < 8; s++) {
+    int raw = readRaw(QTR[s]);
+    int signal = 0;
+    if (calOk && black[s] - white[s] >= MIN_CAL_RANGE)
+      signal = constrain((int32_t)(raw - white[s]) * 1000 /
+                (black[s] - white[s]), (int32_t)0, (int32_t)1000);
+    else
+      signal = raw * 1000L / 4095L;
+    p[s] = (uint8_t)((signal * 255L + 500) / 1000);
+    if (calOk && signal > 250) {
+      weighted += (long)(signal - 250) * s;
+      total += (long)(signal - 250);
+    }
+  }
+  uint16_t pos = total > 0 ? (uint16_t)(weighted * 1000L / total) : 0xffff;
+  p[8] = (uint8_t)(pos & 255); p[9] = (uint8_t)(pos >> 8);
+  p[10] = ((total > 0) ? 1 : 0) | (calOk ? 2 : 0) |
+          (robotOn ? 4 : 0) | (calibrating ? 8 : 0);
+  p[11] = (uint8_t)(int8_t)constrain(lastMotorLeft * 100 / 255, -100, 100);
+  p[12] = (uint8_t)(int8_t)constrain(lastMotorRight * 100 / 255, -100, 100);
+  sendFramed(PKT_SENSOR, p, sizeof(p));
+}
+
+// 9-byte legacy status message or CRC-framed status (when telemetry enabled).
 // 9-byte status message. This also lets the app read NVS-restored PID settings.
 void sendStatusFrame() {
   uint8_t frame[9];
@@ -271,7 +373,12 @@ void sendStatusFrame() {
   uint8_t crc = 0;
   for (int i = 1; i <= 7; i++) crc ^= frame[i];
   frame[8] = crc;
-  BT.write(frame, sizeof(frame));
+  if (telemetryEnabled) {
+    uint8_t p[8];
+    for (int i = 0; i < 7; ++i) p[i] = frame[i+1];
+    p[7] = 0; // reserved for future protocol versions
+    sendFramed(PKT_STATUS, p, sizeof(p));
+  } else BT.write(frame, sizeof(frame));
 }
 
 // ---------------- Bluetooth command reader ----------------
@@ -279,7 +386,7 @@ void sendStatusFrame() {
 void readBluetooth() {
   while (BT.available() >= 2) {
     int cmd = BT.peek();
-    if (cmd < 1 || cmd > 10) {
+    if (cmd < 1 || cmd > 12) {
       BT.read();  // skip invalid leading byte
       continue;
     }
@@ -290,18 +397,33 @@ void readBluetooth() {
         (cmd == 7 && val > 1) ||
         (cmd == 8 && val != 1) ||
         (cmd == 9 && val != 0) ||
-        (cmd == 10 && val != 1)) {
+        (cmd == 10 && val != 1) ||
+        (cmd == 11 && val > 1) ||
+        (cmd == 12 && val != 0)) {
       BT.write(NAK);
       continue;
     }
 
+    if (cmd == 11) {
+      telemetryEnabled = (val == 1);
+      lastTelemetryLeaseMs = millis();
+      if (val == 1) lastTelemetryMs = 0;
+      BT.write(ACK);
+      continue;
+    }
+    if (cmd == 12) {
+      if (telemetryEnabled) sendCalibrationFrame();
+      else BT.write(NAK);
+      continue;
+    }
     if (cmd == 9) {
       sendStatusFrame();  // 9 bytes, no additional ACK
       continue;
     }
     if (cmd == 10) {
       lastHeartbeatMs = millis();
-      BT.write(ACK);
+      // Heartbeats are deliberately silent in telemetry mode.
+      if (!telemetryEnabled) BT.write(ACK);
       continue;
     }
     if (cmd == 8) {
@@ -319,15 +441,32 @@ void readBluetooth() {
       if (val == 0) {
         stopRobot();
         BT.write(ACK);
-        if (pidDirty) savePID();  // save safely while stopped
+        sendStatusFrame(); // App already parses this: confirms motors DISARMED.
+        Serial.println("BT STOP accepted; motor PWM = 0");
+        if (pidDirty) savePID();
       } else if (calOk && !calibrating && !calibrationPending) {
         robotOn = true;
         pidLast = false;
+        iTerm = 0.0f;
         lastHeartbeatMs = millis();
-        lastUs = micros();  // avoid a huge dt/integral jump after waiting for START
+        lastUs = micros();
+        startPulseAtMs = millis();
+        startPulseActive = START_PULSE_MS > 0;
+
+        // Drive both motors immediately, before the first QTR PID sample.
+        // Gives low-speed motors an initial kick against static friction.
+        if (startPulseActive) {
+          setMotors(START_PULSE_PWM, START_PULSE_PWM);
+        }
         BT.write(ACK);
+        sendStatusFrame(); // App already parses this: confirms START accepted.
+        Serial.printf("BT START accepted: startup PWM=%d/%d, PID base=%d max=%d\n",
+                      START_PULSE_PWM, 255, BASE_PWM, MAX_PWM);
       } else {
         BT.write(NAK);
+        sendStatusFrame(); // Revert app's optimistic RUNNING UI to actual state.
+        Serial.printf("BT START rejected: calOk=%d calibrating=%d pending=%d\n",
+                      calOk, calibrating, calibrationPending);
       }
       continue;
     }
@@ -369,6 +508,7 @@ bool performCalibration() {
     for (int s = 0; s < 8; ++s) sum[s] += (uint32_t)readRaw(QTR[s]);
     ++samples;
     readBluetooth();
+    sendSensorFrameIfDue();
     yield();
   }
   int newWhite[8];
@@ -384,6 +524,7 @@ bool performCalibration() {
       if (raw > newBlack[s]) newBlack[s] = raw;
     }
     readBluetooth();
+    sendSensorFrameIfDue();
     yield();
   }
 
@@ -404,11 +545,13 @@ bool performCalibration() {
     showLED(0, 40, 0);  // GREEN: calibration OK
     Serial.println("Calibration OK");
     BT.write(CAL_SUCCESS);
+    if (telemetryEnabled) { sendCalibrationFrame(); sendStatusFrame(); }
   } else {
     calOk = false;
     showLED(40, 0, 0);  // RED: calibration failed
     Serial.println("Calibration FAILED: motors disabled");
     BT.write(CAL_FAILURE);
+    if (telemetryEnabled) sendStatusFrame();
   }
   calibrating = false;
   lastUs = micros();
@@ -451,8 +594,9 @@ void setup() {
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
   Serial.begin(115200);
-  BT.setRxBufferSize(256);  // default size, made explicit
+  BT.setRxBufferSize(512);  // default size, made explicit
   BT.begin(9600, SERIAL_8N1, BT_RX_PIN, BT_TX_PIN);
+  Serial.println("HC-06 opened on UART0 GPIO44/RX and GPIO43/TX at 9600 baud");
 
   prefsReady = prefs.begin("lfr", false);
   if (!prefsReady) Serial.println("WARNING: NVS unavailable; settings won't persist");
@@ -493,11 +637,13 @@ void setup() {
 void loop() {
   readBluetooth();
   checkBootButton();
+  sendSensorFrameIfDue();
 
   if (REQUIRE_APP_HEARTBEAT && robotOn &&
       (uint32_t)(millis() - lastHeartbeatMs) > HEARTBEAT_TIMEOUT_MS) {
     stopRobot();
     BT.write(HEARTBEAT_TIMEOUT_REPLY);
+    sendStatusFrame();
     Serial.println("Safety stop: no app heartbeat for 2.5 seconds");
   }
 
@@ -510,7 +656,7 @@ void loop() {
 
   // Save only after the user stops changing PID values, to limit flash wear.
   // NVS write may briefly interrupt the control loop.
-  if (pidDirty &&
+  if (!robotOn && pidDirty &&
       (uint32_t)(millis() - lastPIDChangeMs) >= PID_SAVE_DELAY_MS &&
       (lastSaveAttemptMs == 0 ||
        (uint32_t)(millis() - lastSaveAttemptMs) >= 5000U)) {
@@ -518,6 +664,17 @@ void loop() {
   }
 
   if (!calOk || !robotOn) return; // stopRobot() already set zero duty
+
+  // Nonblocking startup pulse: still checks Bluetooth, BOOT and heartbeat.
+  // No delay() here; STOP always acts immediately.
+  if (startPulseActive) {
+    if ((uint32_t)(millis() - startPulseAtMs) < START_PULSE_MS) return;
+    startPulseActive = false;
+    pidLast = false;
+    lastUs = micros();
+    Serial.println("Startup pulse complete; PID mode entered");
+    return;
+  }
 
   uint32_t nowUs = micros();
   if ((uint32_t)(nowUs - lastUs) < CONTROL_PERIOD_US) return;
@@ -529,7 +686,7 @@ void loop() {
   for (int s = 0; s < 8; ++s) {
     int raw = readRaw(QTR[s]);
     int32_t span = black[s] - white[s]; // >= MIN_CAL_RANGE if calOk
-    calibrated[s] = constrain((int32_t)(raw - white[s]) * 1000L / span,
+    calibrated[s] = constrain((int32_t)(raw - white[s]) * 1000 / span,
                               (int32_t)0, (int32_t)1000);
     if (calibrated[s] > 250) {
       weighted += (int32_t)(calibrated[s] - 250) * s;
